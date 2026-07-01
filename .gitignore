@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+sftp_root/
+# keep sample data out of real repos; it's regenerable
+# data/*.csv
