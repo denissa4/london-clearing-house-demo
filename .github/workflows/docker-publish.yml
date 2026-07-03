@@ -1,11 +1,16 @@
 name: docker-publish
 
-# Build the MCP server image and publish it to Docker Hub on every push to main.
-# The central IaC repo (Terraform Cloud) then pulls docker.io/denissa4/lch-mcp.
+# Build the MCP server image, publish it to Docker Hub, then roll the EKS
+# deployment so it pulls the fresh :latest (imagePullPolicy: Always).
 #
 # Requires two repo secrets (Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USERNAME  e.g. denissa4
 #   DOCKERHUB_TOKEN     a Docker Hub access token with Read/Write on the repo
+#
+# And two repo variables (Variables tab), from the IaC repo's terraform outputs
+# in terraform/london-clearing-house-demo-eks:
+#   AWS_ROLE_ARN        terraform output -raw github_actions_role_arn
+#   EKS_CLUSTER_NAME    terraform output -raw cluster_name
 
 on:
   push:
@@ -39,3 +44,30 @@ jobs:
             denissa4/lch-mcp:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    # Restart the terraform-owned Deployment so it re-pulls :latest.
+    # No manifest changes -> no drift against the helm_release in terraform.
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-eks
+      cancel-in-progress: false
+    permissions:
+      id-token: write # OIDC token for aws-actions/configure-aws-credentials
+      contents: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-west-2
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME }}" --region eu-west-2
+
+      - name: Rolling restart
+        run: |
+          kubectl rollout restart deployment/lch-mcp -n default
+          kubectl rollout status deployment/lch-mcp -n default --timeout=10m

@@ -21,9 +21,10 @@ These are SYNTHETIC values for a training lab. ISINs, members, notionals are
 invented. Do not treat as real LCH data.
 """
 
+import argparse
 import csv
 import random
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 random.seed(42)  # reproducible
@@ -31,7 +32,9 @@ random.seed(42)  # reproducible
 OUT = Path(__file__).resolve().parent.parent / "data"
 OUT.mkdir(exist_ok=True)
 
-COB = datetime(2026, 6, 30)  # a Tuesday - our close-of-business date
+# Close-of-business date. Defaults to today; override with --cob YYYY-MM-DD in
+# __main__. The generator functions read these module globals.
+COB = datetime.combine(date.today(), datetime.min.time())
 COB_STR = COB.strftime("%Y-%m-%d")
 COB_COMPACT = COB.strftime("%Y%m%d")
 
@@ -272,6 +275,14 @@ def gen_eod_vanilla_swaps():
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Generate synthetic LCH sample reports.")
+    ap.add_argument("--cob", default=date.today().isoformat(),
+                    help="Close-of-business date, ISO YYYY-MM-DD (default: today).")
+    args = ap.parse_args()
+    COB = datetime.fromisoformat(args.cob)
+    COB_STR = COB.strftime("%Y-%m-%d")
+    COB_COMPACT = COB.strftime("%Y%m%d")
+
     print(f"Generating LCH sample reports for COB {COB_STR} into {OUT}/")
     gen_sod_non_cash_collateral()
     gen_dpg_registered_volume()
