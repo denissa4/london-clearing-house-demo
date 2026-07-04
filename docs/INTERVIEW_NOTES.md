@@ -6,7 +6,7 @@ Use the lab as your evidence. When they ask "have you done MCP over APIs?", you 
 
 ## The 60-second architecture pitch
 
-> "The reports today are static files pushed over SFTP — flow and stock data on collateral and swap volumes. I put a FastMCP server in front of that data and expose each report as a typed tool: `get_collateral_holdings`, `get_swapclear_volume`, `get_eod_vanilla_outstanding`, plus discovery tools so an agent can learn the valid dimensions. It runs as a container on Fargate behind an ALB, reads the report data from S3, and the whole stack is Terraform. Locally it reads from an SFTP-landed folder; in cloud it reads from the S3 landing zone — the ingestion boundary is pluggable. That's the platform shift: same source data, but now programmatic, access-controlled, and AI-consumable instead of a file dump."
+> "The reports today are static files pushed over SFTP — flow and stock data on collateral and swap volumes. I put a FastMCP server in front of that data and expose each report as a typed tool: `get_collateral_holdings`, `get_swapclear_volume`, `get_eod_vanilla_outstanding`, plus discovery tools so an agent can learn the valid dimensions. It runs as a container on EKS behind an ALB (fronted by CloudFront), reads the report data from S3, and the whole stack is Terraform + Helm. Locally it reads from an SFTP-landed folder; in cloud it reads from the S3 landing zone — the ingestion boundary is pluggable. That's the platform shift: same source data, but now programmatic, access-controlled, and AI-consumable instead of a file dump."
 
 ---
 
@@ -18,7 +18,7 @@ Use the lab as your evidence. When they ask "have you done MCP over APIs?", you 
 
 **Why discovery tools (`list_dimensions`)?** An agent shouldn't guess valid filter values. A cheap "what dimensions exist" tool lets the model construct correct queries instead of hallucinating a currency or tenor bucket. This is good agent-facing API design.
 
-**Why Streamable HTTP for the deploy, stdio locally?** stdio is fastest (~1ms) but local-only — the host spawns the server as a child process. Streamable HTTP runs it as a web service with SSE, which is what you need for a remote, multi-client, containerised deployment. I default to stdio for MCP Inspector / Claude Desktop and flip to HTTP via an env var for Fargate.
+**Why Streamable HTTP for the deploy, stdio locally?** stdio is fastest (~1ms) but local-only — the host spawns the server as a child process. Streamable HTTP runs it as a web service with SSE, which is what you need for a remote, multi-client, containerised deployment. I default to stdio for MCP Inspector / Claude Desktop and flip to HTTP via an env var for the EKS deployment.
 
 **Why the flow-vs-stock split (two volume tools)?** DPG registered volume is *today's cleared flow*; EOD outstanding is *the standing book*. Different questions, different tools. (See DATA_DICTIONARY.md.)
 
@@ -47,10 +47,10 @@ In the lab, the least-privilege posture shows up concretely: the **task IAM role
 
 - **Split IAM roles**: execution role (image pull + logs) vs task role (app runtime perms). Common mistake is to conflate them.
 - **Remote state with locking**: live via **Terraform Cloud** (org `nlsql`, workspace `london-clearing-house-demo`) — the infra now lives in a central IaC repo that delegates to a reusable `london-clearing-house` module. "Reproducible, version-controlled environments" from my CV is literally this. (The app repo keeps the code + image build; the IaC repo owns the infrastructure.)
-- **Image supply chain**: a **GitHub Actions** workflow (`.github/workflows/docker-publish.yml`) builds the image from the repo `Dockerfile` and pushes `denissa4/lch-mcp:latest` (+ a `:<sha>` tag) to **Docker Hub** on every push to `main` — no manual build step. The Fargate task pulls that image with credentials held in **Secrets Manager** (execution role can read exactly that one secret). No ECR in the current setup.
+- **Image supply chain**: a **GitHub Actions** workflow (`.github/workflows/docker-publish.yml`) builds the image from the repo `Dockerfile` and pushes `denissa4/lch-mcp:latest` (+ a `:<sha>` tag) to **Docker Hub** on every push to `main` — no manual build step. The EKS pod pulls that image via a Docker Hub image-pull secret; the same workflow then rolls the deployment with `kubectl rollout restart` through an AWS OIDC role — push-to-main is the whole release process. No ECR in the current setup.
 - **Least privilege**: task role scoped to one bucket, read-only.
-- **Cost-conscious lab vs production**: I used public subnets to avoid NAT cost; I'd flag that production runs tasks in private subnets with VPC endpoints to S3/ECR, an HTTPS listener with an ACM cert, and autoscaling.
-- **Fargate vs node-based EKS**: I run Fargate today — serverless containers, no node management, same task/pod model. The JD says EKS; the migration is straightforward and I'm comfortable with node-based EKS + Helm too. Be honest here, don't oversell.
+- **Cost-conscious lab vs production**: worker nodes run in private subnets behind a single NAT gateway (a lab-grade SPOF — the NAT egress is also what lets the pods reach the public rate/LEI APIs); production would use a NAT per AZ plus VPC endpoints for S3, an HTTPS listener with an ACM cert at the ALB, and autoscaling.
+- **Node-based EKS + Helm (what the JD asks for)**: I run node-based EKS today — managed node group in private subnets, ALB ingress controller, IRSA for pod IAM, the app packaged as a Helm chart, CI/CD via GitHub Actions with an OIDC role (no long-lived AWS keys). I started the lab on Fargate and migrated to EKS — same container, different orchestrator — so I can speak to both.
 
 ---
 

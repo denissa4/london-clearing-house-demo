@@ -14,7 +14,7 @@ This repo lets you build and run that shift end to end:
  │ EOD Vanilla swaps│             │   get_swapclear_…    │  calls   │  your agent  │
  └──────────────────┘             │   get_eod_vanilla_…  │          └──────────────┘
       (static files)              └──────────────────────┘
-                                    containerised on AWS Fargate,
+                                    containerised on AWS EKS,
                                     infra defined in Terraform
 ```
 
@@ -117,57 +117,52 @@ curl "127.0.0.1:8001/entities/search?name=LCH"  # GLEIF LEI records
 # OpenAPI docs: http://127.0.0.1:8001/docs
 ```
 
-## Deploy to AWS (Fargate + Terraform)
+## Deploy to AWS (EKS + Terraform)
 
-This mirrors your existing "Fargate microservices deployed with Terraform templates" stack.
 The **infrastructure lives in the central IaC repo**, not here — this repo owns the code,
 the image build, and the report data. The Terraform is at
-`../infrastructure-as-code/terraform/london-clearing-house-demo` and uses **Terraform Cloud**
-(org `nlsql`, workspace `london-clearing-house-demo`) for remote, locked state. The ECS task
-pulls the container image from **Docker Hub** (`denissa4/lch-mcp`) with credentials held in
-Secrets Manager.
+`../infrastructure-as-code/terraform/london-clearing-house-demo-eks` (module `lch-mcp-eks`
++ Helm chart `helm/charts/lch-mcp`) and uses **Terraform Cloud** for remote, locked state.
+The pod pulls the container image from **Docker Hub** (`denissa4/lch-mcp`).
+
+**CI/CD is fully automated for EKS** — a push to `main` does everything:
 
 ```bash
-# Shorthand for the central config dir:
-TF=../infrastructure-as-code/terraform/london-clearing-house-demo
-
-# 1. Publish the image: just push to `main`. The `docker-publish` GitHub Actions
-#    workflow builds and pushes denissa4/lch-mcp:latest (+ a :<sha> tag) to Docker
-#    Hub. Wait for the run to go green before deploying. (Requires the repo secrets
-#    DOCKERHUB_USERNAME and DOCKERHUB_TOKEN — see below.)
+# Push to main. The `docker-publish` GitHub Actions workflow:
+#   1. builds and pushes denissa4/lch-mcp:latest (+ a :<sha> tag) to Docker Hub
+#   2. assumes the AWS OIDC role and runs `kubectl rollout restart deployment/lch-mcp`
+#      on the EKS cluster, waiting for the rollout to complete
 git push origin main
 
-# 2. Deploy the infra (requires Terraform Cloud auth for the `nlsql` org;
-#    `docker_password` is set as a sensitive variable in the TFC workspace):
-terraform -chdir="$TF" init
-terraform -chdir="$TF" apply
+# The public MCP endpoint (CloudFront in front of the EKS ALB):
+#   https://d3j87cdpfnkmyh.cloudfront.net/mcp
+# (also available as `terraform output -raw cloudfront_url` in the EKS config dir)
 
-# 3. Upload the data to the reports bucket:
+# Upload report data to the bucket the pod reads:
+TF=../infrastructure-as-code/terraform/london-clearing-house-demo-eks
 ./scripts/sftp_and_s3.sh s3-sync "$(terraform -chdir="$TF" output -raw reports_bucket)"
 
-# 4. The MCP endpoint:
-terraform -chdir="$TF" output -raw mcp_endpoint    # http://<alb-dns>  (append the MCP path)
+# Verify the deployment end-to-end (22 assertions against the live endpoint):
+python scripts/e2e_test.py
 ```
 
-**CI setup (one-time):** add two repo secrets under **Settings → Secrets and variables
-→ Actions** — `DOCKERHUB_USERNAME` (`denissa4`) and `DOCKERHUB_TOKEN` (a Docker Hub
-access token with Read/Write on `denissa4/lch-mcp`). The image is then built from the
-`Dockerfile` at the repo root on every push to `main` — no local `docker build` needed.
+**CI setup (one-time):** repo secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`, and repo
+variables `AWS_ROLE_ARN` / `EKS_CLUSTER_NAME` (from the EKS config's terraform outputs).
 
 **Tear it down when done** (it costs money while running):
 ```bash
 terraform -chdir="$TF" destroy
 ```
 
-### What the Terraform builds
-- **VPC** with 2 public subnets across 2 AZs (NAT-free to keep lab cost down).
-- **S3 bucket** (private, encrypted, versioned) — the report landing zone.
-- **ECS Fargate** service behind an **ALB**, `containerInsights` on. Image pulled from **Docker Hub** (creds in Secrets Manager) — no ECR.
-- **IAM**: split execution role (image pull + logs + read the Docker Hub secret) and task role (read-only on *exactly* the reports bucket). Least privilege.
-- **CloudWatch Logs** with 14-day retention.
+### What the Terraform builds (module `lch-mcp-eks`)
+- **VPC** with public subnets (ALB) + private subnets (worker nodes) behind a NAT gateway.
+- **EKS cluster** + managed node group, ALB ingress controller, IRSA for pod IAM.
+- **S3 bucket** (private, encrypted, versioned) — the report landing zone; pod role is read-only on exactly that bucket.
+- **Helm release** of `helm/charts/lch-mcp` — the MCP Deployment/Service/Ingress; image pulled from Docker Hub via an image-pull secret.
+- **CloudFront** in front of the ALB for the public HTTPS endpoint.
 - **State** is **Terraform Cloud** (remote + locked), not a local `.tfstate`.
 
-Production deltas to mention out loud: private subnets + VPC endpoints (no public task IPs), HTTPS listener with ACM cert, OAuth 2.1 in front, autoscaling policy.
+Production deltas to mention out loud: HTTPS listener with ACM cert at the ALB, OAuth 2.1 in front of the MCP, autoscaling policy.
 
 ---
 
@@ -194,7 +189,7 @@ lch-mcp-lab/
     └── INTERVIEW_NOTES.md    how to talk about every design choice
 
 (AWS infra — VPC/ALB/ECS/S3/IAM — lives in the central IaC repo:
- ../infrastructure-as-code/terraform/london-clearing-house-demo, on Terraform Cloud.)
+ ../infrastructure-as-code/terraform/london-clearing-house-demo-eks, on Terraform Cloud.)
 ```
 
 ---
@@ -206,6 +201,6 @@ lch-mcp-lab/
 3. **Run MCP Inspector** and call each tool by hand. Watch the JSON-RPC.
 4. **Wire it into Claude Desktop** and query in natural language — feel the "platform shift."
 5. **Do the SFTP exercise** so you can speak to ingestion.
-6. **Deploy on Fargate with Terraform**, then `destroy`.
+6. **Deploy on EKS with Terraform** (push to `main` for the CI/CD path), then `destroy`.
 7. **Read `docs/INTERVIEW_NOTES.md`** and practise saying each design decision aloud.
 ```

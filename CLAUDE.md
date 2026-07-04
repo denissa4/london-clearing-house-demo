@@ -40,13 +40,13 @@ make clean                               # remove generated CSVs + caches
   `show(...)` calls in it to exercise a specific tool/args, then `python scripts/test_tools.py`.
 - **Run the server with a specific backend/data dir:**
   `DATA_BACKEND=local LCH_DATA_DIR=./sftp_root/data python mcp_server/server.py`
-- **Deploy (billable AWS):** infra is **not in this repo** — it lives in the central
-  IaC repo (`../infrastructure-as-code/terraform/london-clearing-house-demo`, Terraform
-  Cloud). The image is built/published by **GitHub Actions**
-  (`.github/workflows/docker-publish.yml`) on every push to `main` — no local
-  `docker build`. Then `terraform -chdir=<that dir> apply` rolls the service;
-  `terraform ... destroy` when done. See README's "Deploy to AWS" section for the full
-  sequence and the two required Docker Hub repo secrets.
+- **Deploy (billable AWS, EKS only):** infra is **not in this repo** — it lives in the
+  central IaC repo (`../infrastructure-as-code/terraform/london-clearing-house-demo-eks`,
+  Terraform Cloud). **CI/CD is push-to-main**: `.github/workflows/docker-publish.yml`
+  builds/pushes the image to Docker Hub, then rolls the EKS deployment via
+  `kubectl rollout restart` (AWS OIDC role) — no local `docker build`, no manual apply
+  for releases. Public endpoint: `https://d3j87cdpfnkmyh.cloudfront.net/mcp`. Verify with
+  `python scripts/e2e_test.py` (22 live assertions, exit 0/1).
 
 ## Architecture
 
@@ -79,14 +79,16 @@ MCP port is exposed externally.
 server is the query layer on top. `scripts/sftp_and_s3.sh` provides both a local
 Docker SFTP server and an S3 sync to the Terraform-created bucket.
 
-**Deployment** — infra is **not in this repo**. It lives in the central IaC repo at
-`../infrastructure-as-code/terraform/london-clearing-house-demo`, on **Terraform Cloud**
-(org `nlsql`, workspace `london-clearing-house-demo`, remote + locked state), and delegates
-to the reusable module `modules/london-clearing-house`. That module builds: VPC (2 public
-subnets, NAT-free for cost) → ALB → ECS Fargate → task reads reports from S3. IAM uses a
-**split**: execution role (image pull + logs + read the Docker Hub secret) vs task role
-(read-only on *exactly* the reports bucket). The ECS task pulls the image from **Docker Hub**
-(`docker.io/denissa4/lch-mcp`, creds in Secrets Manager) — there is no ECR. `Dockerfile` is
+**Deployment (EKS only)** — infra is **not in this repo**. It lives in the central IaC repo
+at `../infrastructure-as-code/terraform/london-clearing-house-demo-eks` (Terraform Cloud,
+module `modules/lch-mcp-eks` + Helm chart `helm/charts/lch-mcp`): VPC (public subnets for
+the ALB, private subnets + NAT for worker nodes) → EKS cluster + managed node group → Helm
+release of the MCP behind an ALB ingress, fronted by **CloudFront** — the public endpoint is
+`https://d3j87cdpfnkmyh.cloudfront.net/mcp`. The pod pulls `docker.io/denissa4/lch-mcp` via
+an image-pull secret; pod IAM (IRSA) is read-only on exactly the reports bucket. **CI/CD is
+push-to-main**: `.github/workflows/docker-publish.yml` builds/pushes the image, then does a
+`kubectl rollout restart` via an AWS OIDC role. Verify deployments with
+`python scripts/e2e_test.py` (22 assertions against the live endpoint). `Dockerfile` is
 multi-stage, runs as non-root, defaults to HTTP transport + S3 backend, and bundles the
 sample data so the image can also run standalone with `DATA_BACKEND=local`.
 

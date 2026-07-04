@@ -7,11 +7,11 @@
 #   2. sftp the generated CSVs into it
 #   3. Point the MCP server at that folder (DATA_BACKEND=local LCH_DATA_DIR=...)
 #
-# OPTION B - S3 landing zone (matches the Terraform/Fargate deployment):
+# OPTION B - S3 landing zone (matches the Terraform/EKS deployment):
 #   Sync the generated CSVs into the reports S3 bucket, under the lch-reports/
-#   prefix the task expects. The bucket is created by the central IaC repo; get
+#   prefix the pod expects. The bucket is created by the central IaC repo; get
 #   its name from that Terraform Cloud workspace's `reports_bucket` output:
-#     terraform -chdir=../infrastructure-as-code/terraform/london-clearing-house-demo output -raw reports_bucket
+#     terraform -chdir=../infrastructure-as-code/terraform/london-clearing-house-demo-eks output -raw reports_bucket
 # ---------------------------------------------------------------------------
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,7 +56,7 @@ s3_sync() {
   echo ">> Syncing CSVs to s3://$bucket/lch-reports/"
   aws s3 sync "$DATA_DIR" "s3://$bucket/lch-reports/" \
     --exclude "*" --include "*.csv"
-  echo ">> Done. The Fargate task reads from this prefix."
+  echo ">> Done. The EKS pod reads from this prefix."
 }
 
 case "${1:-}" in
