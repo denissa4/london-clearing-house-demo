@@ -32,6 +32,7 @@ and log every tool invocation for audit/compliance.
 
 import io
 import os
+import re
 from datetime import date
 from functools import lru_cache
 from typing import Optional
@@ -47,17 +48,19 @@ LCH_DATA_DIR = os.environ.get("LCH_DATA_DIR", os.path.join(os.path.dirname(__fil
 LCH_S3_BUCKET = os.environ.get("LCH_S3_BUCKET", "")
 LCH_S3_PREFIX = os.environ.get("LCH_S3_PREFIX", "lch-reports").strip("/")
 
-# The COB date these lab files carry. In production you'd resolve the latest
-# available COB dynamically; here we default to the sample date but allow
-# callers to override.
-DEFAULT_COB = os.environ.get("LCH_DEFAULT_COB", "2026-06-30")
+# COB resolution. A caller may pass an explicit `cob`; otherwise fall back to
+# LCH_DEFAULT_COB if it is set (an explicit pin), and finally to the latest COB
+# available in the backend — so the newest uploaded report is served
+# automatically, with no redeploy or env change when a new day lands.
+LCH_DEFAULT_COB = os.environ.get("LCH_DEFAULT_COB")  # optional pin; empty -> use latest
 
 mcp = FastMCP(
     name="lch-reporting",
     instructions=(
         "Query LCH clearing reports (non-cash collateral holdings, SwapClear "
         "registered volumes, and EOD vanilla swap outstanding notional). "
-        "All amounts are synthetic lab data. Use the list_* tools to discover "
+        "All amounts are synthetic lab data. If no COB date is given, the latest "
+        "available report date is used. Use the list_* tools to discover "
         "available dimensions before filtering."
     ),
 )
@@ -78,6 +81,62 @@ def _filename(report: str, cob: str) -> str:
         "dpg_volume": f"DPG_SwapClear_RegisteredVolume_{c}.csv",
         "eod_vanilla": f"EOD_Volume_VanillaSwaps_{c}.csv",
     }[report]
+
+
+# Report filenames end with a compact date suffix, e.g. '..._20260702.csv'.
+_DATE_RE = re.compile(r"_(\d{8})\.csv$")
+
+
+def _list_cob_compacts() -> list[str]:
+    """Discover the report COB dates present in the backend as sorted 'YYYYMMDD'
+    strings (chronological, since fixed-width dates sort lexicographically).
+
+    Listed live on each call (not cached) so a newly uploaded day is picked up
+    without restarting the server.
+    """
+    found: set[str] = set()
+    if DATA_BACKEND == "s3":
+        import boto3  # lazy, mirrors _load
+        s3 = boto3.client("s3")
+        prefix = f"{LCH_S3_PREFIX}/" if LCH_S3_PREFIX else ""
+        for page in s3.get_paginator("list_objects_v2").paginate(
+            Bucket=LCH_S3_BUCKET, Prefix=prefix
+        ):
+            for obj in page.get("Contents", []):
+                m = _DATE_RE.search(obj["Key"])
+                if m:
+                    found.add(m.group(1))
+    else:
+        try:
+            names = os.listdir(LCH_DATA_DIR)
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            m = _DATE_RE.search(name)
+            if m:
+                found.add(m.group(1))
+    return sorted(found)
+
+
+def _latest_cob() -> str:
+    """Latest COB date available in the backend, ISO 'YYYY-MM-DD'."""
+    dates = _list_cob_compacts()
+    if not dates:
+        raise FileNotFoundError(
+            f"No LCH report files found (backend='{DATA_BACKEND}', "
+            f"prefix='{LCH_S3_PREFIX}'); cannot resolve the latest COB."
+        )
+    c = dates[-1]
+    return f"{c[:4]}-{c[4:6]}-{c[6:8]}"
+
+
+def _resolve_cob(cob: Optional[str]) -> str:
+    """A caller-supplied cob wins; else the LCH_DEFAULT_COB pin; else latest available."""
+    if cob:
+        return cob
+    if LCH_DEFAULT_COB:
+        return LCH_DEFAULT_COB
+    return _latest_cob()
 
 
 @lru_cache(maxsize=32)
@@ -109,7 +168,7 @@ def _df_to_records(df: pd.DataFrame, limit: int) -> list[dict]:
 @mcp.tool
 def get_collateral_holdings(
     member: str,
-    cob: str = DEFAULT_COB,
+    cob: Optional[str] = None,
     account: Optional[str] = None,
     collateral_type: Optional[str] = None,
     currency: Optional[str] = None,
@@ -123,7 +182,7 @@ def get_collateral_holdings(
 
     Args:
         member: Clearing member mnemonic, e.g. 'JPM', 'DBK'.
-        cob: Close-of-business date, ISO 'YYYY-MM-DD'.
+        cob: Close-of-business date, ISO 'YYYY-MM-DD'. Defaults to the latest available.
         account: Optional account filter, e.g. 'HOUSE', 'CLIENT-ISA', 'CUST-SEG'.
         collateral_type: Optional 'SECURITY' or 'TRIPARTY'.
         currency: Optional ISO currency filter, e.g. 'EUR'.
@@ -132,6 +191,7 @@ def get_collateral_holdings(
     Returns:
         dict with 'holdings' (list of rows) and 'summary' (count + total cover value).
     """
+    cob = _resolve_cob(cob)
     df = _load("sod_collateral", cob)
     df = df[df["scmmnemonic"] == member.upper()]
     if account:
@@ -156,12 +216,13 @@ def get_collateral_holdings(
 
 
 @mcp.tool
-def get_collateral_summary_by_member(cob: str = DEFAULT_COB) -> dict:
+def get_collateral_summary_by_member(cob: Optional[str] = None) -> dict:
     """
     Aggregate total post-haircut collateral 'cover' value per clearing member
-    for a COB. Useful cross-member view (would be an LCH-internal / risk scope
-    in production, not a member-facing one).
+    for a COB (defaults to the latest available). Useful cross-member view (would
+    be an LCH-internal / risk scope in production, not a member-facing one).
     """
+    cob = _resolve_cob(cob)
     df = _load("sod_collateral", cob)
     agg = (
         df.groupby("scmmnemonic")
@@ -182,7 +243,7 @@ def get_collateral_summary_by_member(cob: str = DEFAULT_COB) -> dict:
 # ---------------------------------------------------------------------------
 @mcp.tool
 def get_swapclear_volume(
-    cob: str = DEFAULT_COB,
+    cob: Optional[str] = None,
     currency: Optional[str] = None,
     product: Optional[str] = None,
     index: Optional[str] = None,
@@ -197,7 +258,7 @@ def get_swapclear_volume(
     Metrics returned per row: trade_count, notional, dv01.
 
     Args:
-        cob: Close-of-business date, ISO 'YYYY-MM-DD'.
+        cob: Close-of-business date, ISO 'YYYY-MM-DD'. Defaults to the latest available.
         currency: e.g. 'USD', 'EUR', 'GBP'.
         product: e.g. 'IRS', 'OIS', 'BASIS', 'INFLATION', 'FRA', 'VNS'.
         index: e.g. 'SOFR', 'ESTR', 'SONIA'.
@@ -205,6 +266,7 @@ def get_swapclear_volume(
         counterparty_type: 'DEALER' or 'CLIENT'.
         limit: Max rows to return.
     """
+    cob = _resolve_cob(cob)
     df = _load("dpg_volume", cob)
     if currency:
         df = df[df["currency"] == currency.upper()]
@@ -235,7 +297,7 @@ def get_swapclear_volume(
 # ---------------------------------------------------------------------------
 @mcp.tool
 def get_eod_vanilla_outstanding(
-    cob: str = DEFAULT_COB,
+    cob: Optional[str] = None,
     currency: Optional[str] = None,
     product: Optional[str] = None,
     index: Optional[str] = None,
@@ -245,7 +307,9 @@ def get_eod_vanilla_outstanding(
     """
     Query EOD vanilla swap notional OUTSTANDING (the standing cleared book).
     Vanilla = IRS / OIS. Metrics: open_trade_count, outstanding_notional, dv01.
+    COB defaults to the latest available.
     """
+    cob = _resolve_cob(cob)
     df = _load("eod_vanilla", cob)
     if currency:
         df = df[df["currency"] == currency.upper()]
@@ -273,11 +337,13 @@ def get_eod_vanilla_outstanding(
 # Discovery helpers (cheap tools that let an agent learn valid filter values)
 # ---------------------------------------------------------------------------
 @mcp.tool
-def list_dimensions(cob: str = DEFAULT_COB) -> dict:
+def list_dimensions(cob: Optional[str] = None) -> dict:
     """
-    List the distinct filter values available across the reports for a COB,
-    so a client/agent can construct valid queries without guessing.
+    List the distinct filter values available across the reports for a COB
+    (defaults to the latest available), so a client/agent can construct valid
+    queries without guessing.
     """
+    cob = _resolve_cob(cob)
     out = {"cob": cob}
     try:
         c = _load("sod_collateral", cob)

@@ -49,7 +49,8 @@ make clean                               # remove generated CSVs + caches
 **`mcp_server/server.py` is the whole application** (single file). Structure:
 
 1. **Config from env vars** — `DATA_BACKEND` (`local`|`s3`), `LCH_DATA_DIR`,
-   `LCH_S3_BUCKET`/`LCH_S3_PREFIX`, `LCH_DEFAULT_COB`, `MCP_TRANSPORT`, `MCP_PORT`.
+   `LCH_S3_BUCKET`/`LCH_S3_PREFIX`, `LCH_DEFAULT_COB` (optional COB pin; unset = latest),
+   `MCP_TRANSPORT`, `MCP_PORT`.
 2. **Pluggable data-access layer** — `_load(report, cob)` is the seam. It reads a
    CSV either from a local dir (an SFTP-landed folder) or from S3, and is wrapped
    in `@lru_cache`. `_filename()` maps a logical report name + COB date to the
@@ -85,8 +86,12 @@ sample data so the image can also run standalone with `DATA_BACKEND=local`.
 - **CSV filenames are date-stamped and must match `_filename()`** — e.g.
   `REP00036a_SOD_NonCashCollateralHoldings_20260630.csv`. A tool call resolves the
   file from `(report, cob)`; a missing file raises `FileNotFoundError`.
-- **Default COB is `2026-06-30`** (`LCH_DEFAULT_COB`); the generator seeds
-  `random.seed(42)` for reproducible data.
+- **COB resolution** (`_resolve_cob` in `server.py`): a caller-supplied `cob` wins;
+  else the `LCH_DEFAULT_COB` env var if set (an explicit pin); else the **latest**
+  report date discovered in the backend (`_latest_cob` lists the `_YYYYMMDD.csv` files
+  live on each unfiltered call — so a newly uploaded day is served with no restart).
+  The generator (`generate_samples.py`) defaults to **today** and takes `--cob YYYY-MM-DD`;
+  it seeds `random.seed(42)` so only the date fields change run to run.
 - **All string filters are upper-cased** before matching (`member.upper()`, etc.).
 - **`member` is free-text in the lab but is a security boundary in production** —
   the code comments flag that the token, not a parameter, must bind the member so
