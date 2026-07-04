@@ -31,12 +31,20 @@ and log every tool invocation for audit/compliance.
 """
 
 import io
+import json
 import os
 import re
+import sys
+import uuid
 from datetime import date
 from functools import lru_cache
 from typing import Optional
 
+# Make the repo root importable so `apis` resolves when run as
+# `python mcp_server/server.py` (sys.path[0] would otherwise be mcp_server/).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import httpx
 import pandas as pd
 from fastmcp import FastMCP
 
@@ -54,16 +62,66 @@ LCH_S3_PREFIX = os.environ.get("LCH_S3_PREFIX", "lch-reports").strip("/")
 # automatically, with no redeploy or env change when a new day lands.
 LCH_DEFAULT_COB = os.environ.get("LCH_DEFAULT_COB")  # optional pin; empty -> use latest
 
+# The in-process data APIs (reference rates + legal entities). The MCP tools call
+# these over localhost; the MCP layer never hits the upstream sources directly.
+API_PORT = int(os.environ.get("API_PORT", "8001"))
+API_BASE_URL = os.environ.get("API_BASE_URL", f"http://127.0.0.1:{API_PORT}")
+
 mcp = FastMCP(
     name="lch-reporting",
     instructions=(
-        "Query LCH clearing reports (non-cash collateral holdings, SwapClear "
-        "registered volumes, and EOD vanilla swap outstanding notional). "
-        "All amounts are synthetic lab data. If no COB date is given, the latest "
-        "available report date is used. Use the list_* tools to discover "
-        "available dimensions before filtering."
+        "Two data routes are available:\n"
+        "1. LCH clearing REPORTS (synthetic lab data): non-cash collateral holdings, "
+        "SwapClear registered volumes, and EOD vanilla swap outstanding notional. Use "
+        "get_collateral_holdings / get_swapclear_volume / get_eod_vanilla_outstanding and "
+        "the list_dimensions discovery tool. If no COB date is given, the latest available "
+        "report date is used.\n"
+        "2. LIVE market data via APIs (real, public sources): reference risk-free rates "
+        "(SOFR/ESTR/SONIA) and legal-entity/counterparty data (GLEIF LEI). Use "
+        "get_reference_rate / get_rate_history / list_rates and lookup_legal_entity / "
+        "get_legal_entity / get_entity_relationships.\n"
+        "Pick the route that fits the question; rates and entities are live, reports are "
+        "synthetic."
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Audit + API client (shared by the live-data tools)
+# ---------------------------------------------------------------------------
+def _client_ip() -> Optional[str]:
+    """Best-effort caller IP for the audit log (X-Forwarded-For behind CloudFront/ALB)."""
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        req = get_http_request()
+        xff = req.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+        return req.client.host if req.client else None
+    except Exception:
+        return None
+
+
+def _audit(event: str, **fields) -> None:
+    """Emit one structured audit record to stdout (picked up by container logs)."""
+    print(json.dumps({"event": event, "ip": _client_ip(), **fields}, default=str), flush=True)
+
+
+def _api_get(path: str, params: Optional[dict] = None) -> dict:
+    """Call an in-process data API, logging the call and propagating a correlation id."""
+    cid = uuid.uuid4().hex
+    _audit("tool_call", path=path, params=params, correlation_id=cid)
+    try:
+        r = httpx.get(f"{API_BASE_URL}{path}", params=params or {},
+                      headers={"X-Correlation-ID": cid}, timeout=20.0)
+        _audit("api_call", path=path, status=r.status_code, correlation_id=cid)
+        if r.status_code >= 400:
+            detail = r.json().get("detail") if r.content else r.reason_phrase
+            return {"error": detail, "status": r.status_code}
+        return r.json()
+    except Exception as e:
+        _audit("api_error", path=path, error=str(e), correlation_id=cid)
+        return {"error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +427,67 @@ def list_dimensions(cob: Optional[str] = None) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Live-data tools (call the in-process APIs; real public sources, not the CSVs)
+# ---------------------------------------------------------------------------
+@mcp.tool
+def list_rates() -> dict:
+    """List the reference risk-free rates available live (SOFR, ESTR, SONIA) with their
+    source and currency. These are the RFR indices used by SwapClear."""
+    return {"rates": _api_get("/rates")}
+
+
+@mcp.tool
+def get_reference_rate(rate: str) -> dict:
+    """Latest published value of a reference risk-free rate.
+
+    Args:
+        rate: 'SOFR' (USD, NY Fed), 'ESTR' (EUR, ECB), or 'SONIA' (GBP, Bank of England).
+    """
+    return _api_get(f"/rates/{rate.upper()}/latest")
+
+
+@mcp.tool
+def get_rate_history(rate: str, start: Optional[str] = None, end: Optional[str] = None) -> dict:
+    """Historical observations of a reference rate.
+
+    Args:
+        rate: 'SOFR', 'ESTR', or 'SONIA'.
+        start: ISO start date 'YYYY-MM-DD' (optional).
+        end: ISO end date 'YYYY-MM-DD' (optional).
+    """
+    params = {}
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    return _api_get(f"/rates/{rate.upper()}/history", params)
+
+
+@mcp.tool
+def lookup_legal_entity(name: str, limit: int = 10) -> dict:
+    """Search the GLEIF Global LEI index for legal entities by (part of) name — use this to
+    resolve a clearing member / counterparty to its LEI and registration details.
+
+    Args:
+        name: Full or partial legal entity name, e.g. 'LCH' or 'JPMorgan'.
+        limit: Max records to return (1-200).
+    """
+    return _api_get("/entities/search", {"name": name, "limit": limit})
+
+
+@mcp.tool
+def get_legal_entity(lei: str) -> dict:
+    """Fetch one legal entity's LEI record (name, status, jurisdiction, legal address)."""
+    return _api_get(f"/entities/{lei}")
+
+
+@mcp.tool
+def get_entity_relationships(lei: str) -> dict:
+    """Corporate hierarchy (direct and ultimate parent) of a legal entity, from GLEIF."""
+    return _api_get(f"/entities/{lei}/relationships")
+
+
 # A read-only MCP *resource* (as opposed to a tool) exposing the data dictionary.
 @mcp.resource("lch://data-dictionary")
 def data_dictionary() -> str:
@@ -388,10 +507,40 @@ def data_dictionary() -> str:
 
 
 # ---------------------------------------------------------------------------
+# In-process data APIs
+# ---------------------------------------------------------------------------
+def _start_api_server() -> None:
+    """Launch the FastAPI data APIs on 127.0.0.1:API_PORT in a daemon thread, so the
+    MCP tools can reach them over localhost within the same container. Only the MCP
+    port is exposed externally."""
+    import socket
+    import threading
+    import time as _time
+
+    import uvicorn
+
+    from apis.app import app as api_app
+
+    def _run():
+        uvicorn.run(api_app, host="127.0.0.1", port=API_PORT, log_level="warning")
+
+    threading.Thread(target=_run, daemon=True, name="data-apis").start()
+
+    # Wait briefly for the port to accept connections before serving MCP.
+    for _ in range(50):
+        try:
+            with socket.create_connection(("127.0.0.1", API_PORT), timeout=0.2):
+                return
+        except OSError:
+            _time.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+    _start_api_server()  # start the rates + entities APIs alongside the MCP
     if transport == "http":
         port = int(os.environ.get("MCP_PORT", "8080"))
         # Streamable HTTP transport - the right choice for a remote,

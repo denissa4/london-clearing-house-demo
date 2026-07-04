@@ -93,6 +93,30 @@ The mental model to articulate in interview: **SFTP/S3 is the ingestion boundary
 
 ---
 
+## Live data APIs (the API + MCP layer)
+
+Beyond the synthetic CSV reports, the server ships two **governed APIs over live, public,
+LCH-relevant data** (no API key). They run **in-process** alongside the MCP
+(`127.0.0.1:8001` by default); the MCP tools call them over localhost, so the MCP layer
+never touches the upstream sources directly.
+
+| API | Path | Backed by | MCP tools |
+|-----|------|-----------|-----------|
+| **Reference Rates** | `/rates` | NY Fed (SOFR), ECB (€STR), Bank of England (SONIA) — the RFR indices used by SwapClear | `list_rates`, `get_reference_rate`, `get_rate_history` |
+| **Legal Entities** | `/entities` | GLEIF Global LEI index (members / counterparties) | `lookup_legal_entity`, `get_legal_entity`, `get_entity_relationships` |
+
+At query time the model picks the route that fits — the synthetic report tools *or* the
+live API tools. Every tool call and downstream API call is written to a structured **audit
+log** (JSON on stdout) with the caller's IP and a correlation id.
+
+```bash
+# Run the server (also starts the APIs); then hit the APIs directly:
+make run-http                                   # MCP on :8080, APIs on 127.0.0.1:8001
+curl 127.0.0.1:8001/rates/SOFR/latest           # {rate_id, date, value, source, ...}
+curl "127.0.0.1:8001/entities/search?name=LCH"  # GLEIF LEI records
+# OpenAPI docs: http://127.0.0.1:8001/docs
+```
+
 ## Deploy to AWS (Fargate + Terraform)
 
 This mirrors your existing "Fargate microservices deployed with Terraform templates" stack.
@@ -154,7 +178,11 @@ lch-mcp-lab/
 ├── .github/workflows/
 │   └── docker-publish.yml   CI: build + push image to Docker Hub on push to main
 ├── data/                    generated sample CSVs (git-ignore in real life)
-├── mcp_server/server.py     the FastMCP server (the star of the show)
+├── mcp_server/server.py     the FastMCP server (both data routes + audit log)
+├── apis/                    in-process FastAPI: rates + entities (live public data)
+│   ├── clients.py           upstream clients (fetch split from parse) + TTL cache
+│   ├── rates.py             /rates router (SOFR / €STR / SONIA)
+│   └── entities.py          /entities router (GLEIF LEI)
 ├── scripts/
 │   ├── generate_samples.py  builds the three report files
 │   ├── test_tools.py        exercises each tool against the data

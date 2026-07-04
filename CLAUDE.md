@@ -4,25 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A miniature recreation of the LCH (London Clearing House) "platform shift": LCH
-publishes static clearing reports (CSV/PDF) over SFTP; this lab puts a **FastMCP
-server in front of that data** so members/AI agents query it programmatically via
-typed, discoverable MCP tools. All data is **synthetic** — field *layouts* follow
-public LCH specs, but ISINs, members, prices and notionals are invented.
+A recreation of the LCH (London Clearing House) "platform shift" as an **API + MCP**
+PoC. A **FastMCP server** exposes two data routes as typed, discoverable tools; the model
+picks whichever fits the question:
 
-Three reports are modelled (see `docs/DATA_DICTIONARY.md` for field-by-field
-provenance against real LCH specs):
+1. **Synthetic LCH reports** (read from CSV, local or S3) — the original lab data:
+   - **REP00036a** — SOD Non-Cash Collateral Holdings (securities + triparty)
+   - **DPG SwapClear Registered Volume** — *flow*: what got cleared today
+   - **EOD Volume Vanilla Swaps** — *stock*: standing outstanding notional at EOD
 
-- **REP00036a** — SOD Non-Cash Collateral Holdings (securities + triparty)
-- **DPG SwapClear Registered Volume** — *flow*: what got cleared today
-- **EOD Volume Vanilla Swaps** — *stock*: standing outstanding notional at EOD
+   (flow-vs-stock is why there are two volume tools; see `docs/DATA_DICTIONARY.md`.)
+2. **Live public data via two in-process APIs** (real, no API key) — the MCP tools call
+   these over localhost; the MCP layer never hits the upstreams directly:
+   - **Reference Rates** (`apis/rates.py`) — SOFR (NY Fed), €STR (ECB), SONIA (BoE); the
+     RFR indices used by SwapClear.
+   - **Legal Entities** (`apis/entities.py`) — GLEIF Global LEI index (members/counterparties).
 
-The flow-vs-stock distinction is why there are two volume tools, not one.
+The synthetic report data is invented (field *layouts* follow public LCH specs); the rates
+and entity data are live.
 
 ## Common commands (run from the repo root)
 
 ```bash
-pip install -r requirements.txt          # fastmcp>=2.0, pandas, boto3
+pip install -r requirements.txt          # fastmcp, pandas, boto3, fastapi, uvicorn, httpx
 make data                                # generate the three sample CSVs into ./data
 make test                                # smoke-test tool logic against the data (implies `data`)
 make run                                 # run MCP server over stdio (Claude Desktop / Inspector)
@@ -46,23 +50,28 @@ make clean                               # remove generated CSVs + caches
 
 ## Architecture
 
-**`mcp_server/server.py` is the whole application** (single file). Structure:
+**`mcp_server/server.py`** is the MCP server; **`apis/`** is a small FastAPI app (the two
+data APIs). Both run in the **same container** — `_start_api_server()` launches the FastAPI
+app on `127.0.0.1:API_PORT` in a daemon thread, then the MCP serves on `MCP_PORT`. Only the
+MCP port is exposed externally.
 
 1. **Config from env vars** — `DATA_BACKEND` (`local`|`s3`), `LCH_DATA_DIR`,
    `LCH_S3_BUCKET`/`LCH_S3_PREFIX`, `LCH_DEFAULT_COB` (optional COB pin; unset = latest),
-   `MCP_TRANSPORT`, `MCP_PORT`.
-2. **Pluggable data-access layer** — `_load(report, cob)` is the seam. It reads a
-   CSV either from a local dir (an SFTP-landed folder) or from S3, and is wrapped
-   in `@lru_cache`. `_filename()` maps a logical report name + COB date to the
-   dated filename convention (`..._YYYYMMDD.csv`). To add a Snowflake/API backend,
-   this is the only function that changes — the tool contract stays identical.
-3. **MCP tools** (`@mcp.tool`) — one query tool per report
-   (`get_collateral_holdings`, `get_swapclear_volume`, `get_eod_vanilla_outstanding`),
-   plus aggregates (`get_collateral_summary_by_member`) and a discovery tool
-   (`list_dimensions`) that returns valid filter values so an agent doesn't guess.
-   Each tool filters a DataFrame by optional args and returns `{summary, rows}`.
-4. **MCP resource** (`@mcp.resource("lch://data-dictionary")`) — read-only schema
-   text. Deliberately a *resource*, not a tool, to demonstrate the MCP primitive split.
+   `MCP_TRANSPORT`, `MCP_PORT`, and `API_PORT`/`API_BASE_URL` (in-process API tier).
+2. **Two data routes:**
+   - *CSV reports* — `_load(report, cob)` is a pluggable seam (`local`/`s3`, `@lru_cache`);
+     `_filename()` maps report+COB to `..._YYYYMMDD.csv`. Tools: `get_collateral_holdings`,
+     `get_swapclear_volume`, `get_eod_vanilla_outstanding`, `get_collateral_summary_by_member`,
+     `list_dimensions`.
+   - *Live APIs* — tools (`get_reference_rate`, `get_rate_history`, `list_rates`,
+     `lookup_legal_entity`, `get_legal_entity`, `get_entity_relationships`) call the local
+     FastAPI via `_api_get()`. The FastAPI routers (`apis/rates.py`, `apis/entities.py`) call
+     upstreams through `apis/clients.py`, where **fetching is split from parsing** so parsers
+     are unit-testable with no network. `clients.py` also holds a TTL cache and sends a real
+     `User-Agent` (NY Fed blocks generic bots).
+3. **Audit log** — `_audit()` prints one JSON record per `tool_call` and `api_call` with the
+   client IP (`X-Forwarded-For`) and a `correlation_id` propagated MCP→API via header.
+4. **MCP resource** (`@mcp.resource("lch://data-dictionary")`) — read-only schema text.
 5. **Transport switch** in `__main__` — stdio by default, Streamable HTTP when
    `MCP_TRANSPORT=http` (the containerised/remote path).
 

@@ -19,6 +19,8 @@ ENV PATH="/opt/venv/bin:$PATH" \
     DATA_BACKEND=s3
 COPY --from=builder /opt/venv /opt/venv
 COPY mcp_server/ /app/mcp_server/
+# The in-process data APIs (reference rates + legal entities) the MCP tools call.
+COPY apis/ /app/apis/
 # Bundle the sample data so the container also runs standalone with DATA_BACKEND=local
 COPY data/ /app/data/
 USER appuser
